@@ -58,6 +58,7 @@ typedef struct Machine_ {
 
    unsigned int activeCPUs;
    unsigned int existingCPUs;
+   char* cpuTypeLabels; /* Optional core type suffixes, indexed by zero-based CPU index. */
 
    UsersTable* usersTable;
    uid_t htopUserId;
