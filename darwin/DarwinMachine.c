@@ -18,6 +18,9 @@ in the source distribution for its full text.
 #include <string.h>
 #include <unistd.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitKeys.h>
+#include <IOKit/IOKitLib.h>
+#include <IOKit/IOTypes.h>
 #include <mach/mach.h>
 #include <mach/processor_info.h>
 #include <sys/mman.h>
@@ -31,6 +34,7 @@ in the source distribution for its full text.
 #include "darwin/PlatformHelpers.h"
 #include "generic/openzfs_sysctl.h"
 #include "zfs/ZfsArcStats.h"
+
 
 // Compatibility for older SDKs.
 #if !defined(HAVE_DECL_KIOMAINPORTDEFAULT) || !HAVE_DECL_KIOMAINPORTDEFAULT
@@ -94,7 +98,7 @@ static bool DarwinMachine_cpuSlotsMatch(unsigned int cpus) {
 
 static bool DarwinMachine_readCPUClusterTypes(char* types, unsigned int cpus) {
    io_registry_entry_t root = IORegistryEntryFromPath(kIOMainPortDefault, kIODeviceTreePlane ":/cpus");
-   if (!root)
+   if (root == IO_OBJECT_NULL)
       return false;
 
    io_iterator_t children;
@@ -116,8 +120,13 @@ static bool DarwinMachine_readCPUClusterTypes(char* types, unsigned int cpus) {
       CFDataRef type = CFDictionaryGetValue(props, CFSTR("cluster-type"));
       int id;
       if (idProp && CFGetTypeID(idProp) == CFNumberGetTypeID() &&
-          CFNumberGetValue(idProp, kCFNumberIntType, &id) && id >= 0 && (unsigned int)id < cpus &&
-          type && CFGetTypeID(type) == CFDataGetTypeID() && CFDataGetLength(type) > 0) {
+         CFNumberGetValue(idProp, kCFNumberIntType, &id) && id >= 0 && (unsigned int)id < cpus &&
+         type && CFGetTypeID(type) == CFDataGetTypeID() && CFDataGetLength(type) > 0) {
+         if (types[id] != '\0') {
+            CFRelease(props);
+            IOObjectRelease(children);
+            return false;
+         }
          types[id] = (char)CFDataGetBytePtr(type)[0];
          found++;
       }
@@ -132,19 +141,21 @@ static bool DarwinMachine_readSysctlUInt(const char* key, unsigned int* value) {
    return sysctlbyname(key, value, &size, NULL, 0) == 0 && size == sizeof(*value);
 }
 
-static bool DarwinMachine_labelCPUClusters(char* types, unsigned int cpus, unsigned int levels) {
-   /* I/O Registry cluster types in descending performance order. A raw 'P'
-      can represent either Performance or Super, depending on the system. */
+static bool DarwinMachine_labelCPUClusters(const char* rawTypes, CPUTypeInfo* types, unsigned int cpus, unsigned int levels) {
+   /* I/O Registry cluster types in descending performance order, matching
+      hw.perflevel0..N-1. A raw 'P' can represent Performance or Super, so
+      verify each cluster's core count against hw.perflevelN.logicalcpu_max
+      and derive the label and tier from hw.perflevelN.name. */
    static const char order[] = { 'P', 'M', 'E' };
    unsigned int counts[ARRAYSIZE(order)] = {0};
    for (unsigned int i = 0; i < cpus; i++) {
-      const char* type = memchr(order, types[i], sizeof(order));
+      const char* type = memchr(order, rawTypes[i], sizeof(order));
       if (!type)
          return false;
       counts[type - order]++;
    }
 
-   char labels[ARRAYSIZE(order)] = {0};
+   CPUTypeInfo clusterTypes[ARRAYSIZE(order)] = {0};
    unsigned int level = 0;
    for (size_t i = 0; i < ARRAYSIZE(order); i++) {
       if (!counts[i])
@@ -163,35 +174,48 @@ static bool DarwinMachine_labelCPUClusters(char* types, unsigned int cpus, unsig
       xSnprintf(key, sizeof(key), "hw.perflevel%u.name", level);
       if (sysctlbyname(key, name, &size, NULL, 0) != 0)
          return false;
-      if (!String_eq(name, "Efficiency") && !String_eq(name, "Performance") && !String_eq(name, "Super"))
+
+      CPUTypeTier tier;
+      if (String_eq(name, "Efficiency"))
+         tier = CPU_TYPE_TIER_LOW;
+      else if (String_eq(name, "Performance"))
+         tier = CPU_TYPE_TIER_MEDIUM;
+      else if (String_eq(name, "Super"))
+         tier = CPU_TYPE_TIER_HIGH;
+      else
          return false;
 
-      labels[i] = name[0];
+      clusterTypes[i].label = name[0];
+      clusterTypes[i].tier = tier;
       level++;
    }
    if (level != levels)
       return false;
 
    for (unsigned int i = 0; i < cpus; i++) {
-      const char* type = memchr(order, types[i], sizeof(order));
-      types[i] = labels[type - order];
+      const char* type = memchr(order, rawTypes[i], sizeof(order));
+      types[i] = clusterTypes[type - order];
    }
    return true;
 }
 
-static char* DarwinMachine_getCPUTypeLabels(unsigned int cpus) {
+static CPUTypeInfo* DarwinMachine_getCPUTypes(unsigned int cpus) {
    unsigned int arm64;
    unsigned int levels;
    if (cpus < 2 || !DarwinMachine_readSysctlUInt("hw.optional.arm64", &arm64) || !arm64 ||
-       !DarwinMachine_readSysctlUInt("hw.nperflevels", &levels) || levels < 2 ||
-       !DarwinMachine_cpuSlotsMatch(cpus))
+      !DarwinMachine_readSysctlUInt("hw.nperflevels", &levels) || levels < 2 ||
+      !DarwinMachine_cpuSlotsMatch(cpus))
       return NULL;
 
-   char* labels = xCalloc(cpus, sizeof(*labels));
-   if (DarwinMachine_readCPUClusterTypes(labels, cpus) && DarwinMachine_labelCPUClusters(labels, cpus, levels))
-      return labels;
+   char* rawTypes = xCalloc(cpus, sizeof(*rawTypes));
+   CPUTypeInfo* types = xCalloc(cpus, sizeof(*types));
+   bool ok = DarwinMachine_readCPUClusterTypes(rawTypes, cpus) &&
+      DarwinMachine_labelCPUClusters(rawTypes, types, cpus, levels);
+   free(rawTypes);
+   if (ok)
+      return types;
 
-   free(labels);
+   free(types);
    return NULL;
 }
 
@@ -231,7 +255,8 @@ Machine* Machine_new(UsersTable* usersTable, uid_t userId) {
    /* Initialize the CPU information */
    super->activeCPUs = DarwinMachine_allocateCPULoadInfo(&this->prev_load);
    super->existingCPUs = super->activeCPUs;
-   super->cpuTypeLabels = DarwinMachine_getCPUTypeLabels(super->existingCPUs);
+   super->cpuTypes = DarwinMachine_getCPUTypes(super->existingCPUs);
+   super->cpuTypeCount = super->cpuTypes ? super->existingCPUs : 0;
    DarwinMachine_getHostInfo(&this->host_info);
    DarwinMachine_allocateCPULoadInfo(&this->curr_load);
 

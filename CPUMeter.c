@@ -75,19 +75,27 @@ static void CPUMeter_init(Meter* this) {
          xSnprintf(caption, sizeof(caption), "%2d%c", Settings_cpuId(host->settings, coreID), threadLetter);
       } else {
          unsigned int id = Settings_cpuId(host->settings, cpu - 1);
-         /* Bar and graph modes reserve three columns for the caption. */
-         if (host->cpuTypeLabels && cpu <= host->existingCPUs && id < 100) {
-            char type = host->cpuTypeLabels[cpu - 1];
-            xSnprintf(caption, sizeof(caption), "%2u%c", id, type);
-            switch (type) {
-               case 'E':
-                  this->captionColor = CPU_TYPE_EFFICIENCY;
+         /* Bar and graph modes reserve three columns for the caption; fall back
+            to plain numbers for all CPUs if any displayed ID needs three digits. */
+         if (host->settings->showCPUTypeLabels &&
+            host->cpuTypes &&
+            cpu <= host->existingCPUs &&
+            cpu <= host->cpuTypeCount &&
+            Settings_cpuId(host->settings, host->existingCPUs - 1) < 100 &&
+            host->cpuTypes[cpu - 1].label != '\0') {
+            const CPUTypeInfo* type = &host->cpuTypes[cpu - 1];
+            xSnprintf(caption, sizeof(caption), "%2u%c", id, type->label);
+            switch (type->tier) {
+               case CPU_TYPE_TIER_LOW:
+                  this->captionColor = CPU_TYPE_LOW;
                   break;
-               case 'P':
-                  this->captionColor = CPU_TYPE_PERFORMANCE;
+               case CPU_TYPE_TIER_MEDIUM:
+                  this->captionColor = CPU_TYPE_MEDIUM;
                   break;
-               case 'S':
-                  this->captionColor = CPU_TYPE_SUPER;
+               case CPU_TYPE_TIER_HIGH:
+                  this->captionColor = CPU_TYPE_HIGH;
+                  break;
+               case CPU_TYPE_TIER_NONE:
                   break;
             }
          } else {
